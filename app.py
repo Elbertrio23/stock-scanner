@@ -15,6 +15,12 @@ WATCHLIST = [
     "HCLTECH.NS", "TCS.NS", "BHARTIARTL.NS", "RELIANCE.NS", "INFY.NS"
 ]
 
+def clean_num(val, default=0.0):
+    """Safely converts numpy/pandas numbers into standard floats, replacing NaN/Inf."""
+    if val is None or pd.isna(val) or np.isnan(val) or np.isinf(val):
+        return default
+    return float(val)
+
 def analyze_stock(symbol):
     try:
         df = yf.download(symbol, period="1y", interval="1d", progress=False)
@@ -46,6 +52,11 @@ def analyze_stock(symbol):
         )
         df['ATR'] = df['TR'].rolling(window=14).mean()
 
+        # Drop initial NaN rows to prevent JSON breakdown
+        df = df.dropna().copy()
+        if len(df) < 20:
+            return None, []
+
         # -------------------------------------------------------------
         # 1. LIVE SIGNAL SCANNER
         # -------------------------------------------------------------
@@ -62,11 +73,14 @@ def analyze_stock(symbol):
 
         live_result = None
         if signals:
-            entry = float(latest['Close'])
-            atr = float(latest['ATR']) if not np.isnan(latest['ATR']) else entry * 0.03
+            entry = clean_num(latest['Close'])
+            atr = clean_num(latest['ATR'], entry * 0.03)
+            if atr == 0: atr = entry * 0.03
+            
             sl = round(entry - (1.5 * atr), 2)
             tp = round(entry + (3.0 * atr), 2)
-            rr_ratio = round((tp - entry) / (entry - sl), 2) if (entry - sl) > 0 else 2.0
+            risk = entry - sl
+            rr_val = round((tp - entry) / risk, 2) if risk > 0 else 2.0
             
             live_result = {
                 "symbol": symbol,
@@ -74,7 +88,7 @@ def analyze_stock(symbol):
                 "signals": signals,
                 "sl": sl,
                 "tp": tp,
-                "rr_ratio": f"1:{rr_ratio}",
+                "rr_ratio": f"1:{rr_val}",
                 "date": latest.name.strftime('%Y-%m-%d')
             }
 
@@ -83,11 +97,11 @@ def analyze_stock(symbol):
         # -------------------------------------------------------------
         history_signals = []
         lookback_days = 126
-        start_idx = max(20, len(df) - lookback_days)
+        start_idx = max(0, len(df) - lookback_days)
         
         for i in range(start_idx, len(df) - 1):
             row = df.iloc[i]
-            prev_row = df.iloc[i-1]
+            prev_row = df.iloc[i-1] if i > 0 else row
             
             h_signals = []
             if row['Return_5d'] >= 5.0 and row['Close'] > row['SMA_20']:
@@ -98,8 +112,9 @@ def analyze_stock(symbol):
                 h_signals.append("Dip Buy")
                 
             if h_signals:
-                entry_price = float(row['Close'])
-                atr = float(row['ATR']) if not np.isnan(row['ATR']) else entry_price * 0.03
+                entry_price = clean_num(row['Close'])
+                atr = clean_num(row['ATR'], entry_price * 0.03)
+                if atr == 0: atr = entry_price * 0.03
                 
                 risk = 1.5 * atr
                 reward = 3.0 * atr
@@ -109,51 +124,56 @@ def analyze_stock(symbol):
                 
                 # Forward simulation up to 25 trading days
                 forward_df = df.iloc[i+1 : min(i+26, len(df))]
+                if len(forward_df) == 0:
+                    continue
+                    
                 status = "EXPIRED"
                 autopsy = ""
                 days_held = len(forward_df)
-                return_pct = round((forward_df.iloc[-1]['Close'] - entry_price) / entry_price * 100, 1) if days_held > 0 else 0.0
+                last_close = clean_num(forward_df.iloc[-1]['Close'], entry_price)
+                return_pct = round((last_close - entry_price) / entry_price * 100, 1) if entry_price > 0 else 0.0
                 
                 peak_high = entry_price
                 trough_low = entry_price
                 exit_day = 0
                 
                 for idx, (_, f_row) in enumerate(forward_df.iterrows()):
-                    if f_row['High'] > peak_high:
-                        peak_high = f_row['High']
-                    if f_row['Low'] < trough_low:
-                        trough_low = f_row['Low']
+                    f_high = clean_num(f_row['High'], entry_price)
+                    f_low = clean_num(f_row['Low'], entry_price)
+                    
+                    if f_high > peak_high:
+                        peak_high = f_high
+                    if f_low < trough_low:
+                        trough_low = f_low
                         
-                    if f_row['High'] >= tp_price and status == "EXPIRED":
+                    if f_high >= tp_price and status == "EXPIRED":
                         status = "WIN"
                         exit_day = idx + 1
-                        return_pct = round((tp_price - entry_price) / entry_price * 100, 1)
-                    elif f_row['Low'] <= sl_price and status == "EXPIRED":
+                        return_pct = round((tp_price - entry_price) / entry_price * 100, 1) if entry_price > 0 else 0.0
+                    elif f_low <= sl_price and status == "EXPIRED":
                         status = "LOSS"
                         exit_day = idx + 1
-                        return_pct = round((sl_price - entry_price) / entry_price * 100, 1)
+                        return_pct = round((sl_price - entry_price) / entry_price * 100, 1) if entry_price > 0 else 0.0
 
-                # --- AUTOPSY DIAGNOSTIC GENERATOR ---
+                # AUTOPSY DIAGNOSTIC GENERATOR
                 if status == "WIN":
-                    # Check post-target max extension
                     max_rr = round((peak_high - entry_price) / risk, 1) if risk > 0 else initial_rr
-                    extra_pct = round(((peak_high - tp_price) / entry_price) * 100, 1)
+                    extra_pct = round(((peak_high - tp_price) / entry_price) * 100, 1) if entry_price > 0 else 0.0
                     if extra_pct > 1.0:
                         autopsy = f"🎯 Target hit in {exit_day}d. Extended +{extra_pct}% further (Peak R:R reached 1:{max_rr})."
                     else:
                         autopsy = f"🎯 Target hit in {exit_day}d. Exact hit before momentum faded."
                         
                 elif status == "LOSS":
-                    # Diagnose what went wrong
                     loss_rows = forward_df[forward_df['Low'] <= sl_price]
                     exit_bar = loss_rows.iloc[0] if len(loss_rows) > 0 else forward_df.iloc[-1]
                     
                     reasons = []
-                    if exit_bar['Open'] < sl_price:
+                    if clean_num(exit_bar['Open']) < sl_price:
                         reasons.append("Sharp Gap-Down Slippage")
-                    if row['Close'] < row['SMA_50']:
+                    if clean_num(row['Close']) < clean_num(row['SMA_50']):
                         reasons.append("Trend Failure (Trading below 50-SMA)")
-                    if 'Vol_SMA20' in row and exit_bar['Volume'] > (1.5 * row['Vol_SMA20']):
+                    if clean_num(exit_bar['Volume']) > (1.5 * clean_num(row['Vol_SMA20'])):
                         reasons.append("High Institutional Volume Selling")
                     
                     if not reasons:
@@ -173,7 +193,7 @@ def analyze_stock(symbol):
                     "tp": tp_price,
                     "initial_rr": f"1:{initial_rr}",
                     "status": status,
-                    "return_pct": return_pct,
+                    "return_pct": clean_num(return_pct),
                     "autopsy": autopsy
                 })
                 
@@ -202,8 +222,10 @@ def scan():
     total_trades = len(historical_logs)
     wins = len([x for x in historical_logs if x['status'] == 'WIN'])
     losses = len([x for x in historical_logs if x['status'] == 'LOSS'])
-    win_rate = round((wins / total_trades) * 100, 1) if total_trades > 0 else 0
-    avg_return = round(sum([x['return_pct'] for x in historical_logs]) / total_trades, 1) if total_trades > 0 else 0
+    win_rate = round((wins / total_trades) * 100, 1) if total_trades > 0 else 0.0
+    
+    returns = [x['return_pct'] for x in historical_logs if not np.isnan(x['return_pct'])]
+    avg_return = round(sum(returns) / len(returns), 1) if len(returns) > 0 else 0.0
 
     return jsonify({
         "timestamp": datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC'),
@@ -212,8 +234,8 @@ def scan():
             "total_trades": total_trades,
             "wins": wins,
             "losses": losses,
-            "win_rate": win_rate,
-            "avg_return": avg_return
+            "win_rate": clean_num(win_rate),
+            "avg_return": clean_num(avg_return)
         },
         "historical_logs": sorted(historical_logs, key=lambda x: x['date'], reverse=True)[:35]
     })
