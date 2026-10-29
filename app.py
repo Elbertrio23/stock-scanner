@@ -1,5 +1,5 @@
 # ============================================================
-# STOCK SCANNER — Render Deployment
+# STOCK SCANNER — UI Upgrade (JARVIS Edition)
 # Flask app with dashboard + daily scan endpoint
 # ============================================================
 
@@ -16,13 +16,13 @@ warnings.filterwarnings('ignore')
 app = Flask(__name__)
 
 # ============================================================
-# GLOBAL STATE (stores latest scan in memory)
+# GLOBAL STATE
 # ============================================================
 
 latest_signals = []
 scan_history = []
-last_scan_time = "Never"
-scan_status = "Idle"
+last_scan_time = "STANDBY"
+scan_status = "System Idle"
 
 # ============================================================
 # CONFIGURATION
@@ -33,22 +33,18 @@ RISK_PER_TRADE = 0.02
 MAX_OPEN_TRADES = 5
 MIN_SIGNAL_STRENGTH = 2
 
-# Focused stock list (30 stocks — optimized for Render free tier)
 STOCKS = {
-    # US Mega Caps
     "AAPL": "Apple", "MSFT": "Microsoft", "GOOGL": "Alphabet",
     "AMZN": "Amazon", "NVDA": "Nvidia", "META": "Meta",
     "TSLA": "Tesla", "JPM": "JP Morgan", "V": "Visa",
     "CRM": "Salesforce", "AMD": "AMD", "NFLX": "Netflix",
-    # US ETFs
     "SPY": "S&P 500", "QQQ": "Nasdaq 100", "IWM": "Russell 2000",
     "XLF": "Financials", "XLE": "Energy", "XLK": "Tech",
-    # India Nifty 50
     "RELIANCE.NS": "Reliance", "TCS.NS": "TCS",
     "HDFCBANK.NS": "HDFC Bank", "INFY.NS": "Infosys",
     "ICICIBANK.NS": "ICICI Bank", "SBIN.NS": "SBI",
     "BHARTIARTL.NS": "Bharti Airtel", "ITC.NS": "ITC",
-    "HCLTECH.NS": "HCL Tech", "BAJFINANCE.NS": "Bajaj Finance",
+    "HCLTECH.NS": "HCL Tech", "BAJFINANCE.NS": "Bajaj",
     "WIPRO.NS": "Wipro", "TATASTEEL.NS": "Tata Steel",
 }
 
@@ -58,66 +54,40 @@ STRATEGY_PARAMS = {
     "5% Drop Buy":     {"sl": 5, "tp": 10, "hold": 15},
 }
 
-
 # ============================================================
-# INDICATORS
+# INDICATORS & STRATEGIES
 # ============================================================
 
 def add_indicators(df):
     d = df.copy()
-    d['SMA50']  = d['Close'].rolling(50).mean()
-    d['SMA200'] = d['Close'].rolling(200).mean()
-    d['EMA20']  = d['Close'].ewm(span=20).mean()
-
     delta = d['Close'].diff()
     gain = delta.where(delta > 0, 0).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     d['RSI'] = 100 - (100 / (1 + gain / loss.replace(0, 0.001)))
-
     d['BB_Mid'] = d['Close'].rolling(20).mean()
-    bb_std = d['Close'].rolling(20).std()
-    d['BB_Lower'] = d['BB_Mid'] - 2 * bb_std
-
+    d['BB_Lower'] = d['BB_Mid'] - 2 * d['Close'].rolling(20).std()
     d['ROC_3'] = d['Close'].pct_change(3) * 100
     d['ROC_5'] = d['Close'].pct_change(5) * 100
     return d
 
-
-# ============================================================
-# STRATEGIES
-# ============================================================
-
 def check_weekly_momentum(d):
-    i = len(d) - 1
-    if d['ROC_5'].iloc[i] > 5:
-        return True, "5-day momentum >5%"
-    return False, ""
+    return d['ROC_5'].iloc[-1] > 5, "5d Mom > 5%"
 
 def check_bb_bounce(d):
     i = len(d) - 1
     touched = d['Low'].iloc[i] <= d['BB_Lower'].iloc[i] * 1.01
     bounce = d['Close'].iloc[i] > d['BB_Lower'].iloc[i]
     near = d['Low'].iloc[i-1] <= d['BB_Lower'].iloc[i-1] * 1.02 if i > 0 else False
-    if (touched and bounce) or (near and bounce):
-        return True, "BB lower band bounce"
-    return False, ""
+    return (touched and bounce) or (near and bounce), "BB Bounce"
 
 def check_drop_buy(d):
     i = len(d) - 1
-    if i < 2:
-        return False, ""
+    if i < 2: return False, ""
     dropped = d['ROC_3'].iloc[i-1] < -5 or d['ROC_3'].iloc[i] < -5
     bouncing = d['Close'].iloc[i] > d['Close'].iloc[i-1]
-    if dropped and bouncing:
-        return True, "5% drop + bounce"
-    return False, ""
+    return dropped and bouncing, "5% Drop Buy"
 
-STRATEGIES = [
-    ("Weekly Momentum", check_weekly_momentum),
-    ("BB Bounce",       check_bb_bounce),
-    ("5% Drop Buy",     check_drop_buy),
-]
-
+STRATEGIES = [("Weekly Momentum", check_weekly_momentum), ("BB Bounce", check_bb_bounce), ("5% Drop Buy", check_drop_buy)]
 
 # ============================================================
 # SCANNER CORE
@@ -125,26 +95,19 @@ STRATEGIES = [
 
 def run_scan():
     global latest_signals, last_scan_time, scan_status
-
-    scan_status = "Scanning..."
+    scan_status = "SCANNING NETWORK..."
     signals = []
 
     for ticker, name in STOCKS.items():
-        is_india = ".NS" in ticker
-        market = "🇮🇳" if is_india else "🇺🇸"
-
+        market = "IND" if ".NS" in ticker else "USA"
         try:
             df = yf.download(ticker, period="6mo", interval="1d", progress=False)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            if len(df) < 50:
-                continue
-
+            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+            if len(df) < 50: continue
             df = df[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
             d = add_indicators(df)
 
-            active = []
-            reasons = []
+            active, reasons = [], []
             for sname, sfunc in STRATEGIES:
                 triggered, reason = sfunc(d)
                 if triggered:
@@ -152,265 +115,296 @@ def run_scan():
                     reasons.append(reason)
 
             if len(active) >= MIN_SIGNAL_STRENGTH:
-                last = d.iloc[-1]
-                entry = round(float(last['Close']), 2)
+                entry = round(float(d['Close'].iloc[-1]), 2)
                 best_sl = min(STRATEGY_PARAMS[s]['sl'] for s in active)
                 best_tp = max(STRATEGY_PARAMS[s]['tp'] for s in active)
-                best_hold = max(STRATEGY_PARAMS[s]['hold'] for s in active)
+                
                 sl = round(entry * (1 - best_sl / 100), 2)
                 tp = round(entry * (1 + best_tp / 100), 2)
+                
+                # Risk Reward Math
+                risk_pt = entry - sl
+                reward_pt = tp - entry
+                rr = round(reward_pt / risk_pt, 2) if risk_pt > 0 else 0
 
                 risk_amt = ACCOUNT_SIZE * RISK_PER_TRADE
-                risk_per_share = abs(entry - sl)
-                shares = int(risk_amt / risk_per_share) if risk_per_share > 0 else 0
-
-                rsi_val = round(float(last['RSI']), 1) if not pd.isna(last['RSI']) else 50
+                shares = int(risk_amt / risk_pt) if risk_pt > 0 else 0
 
                 signals.append({
-                    'ticker': ticker,
-                    'name': name,
-                    'market': market,
-                    'price': entry,
-                    'strategies': " + ".join(active),
-                    'count': len(active),
-                    'sl': sl, 'sl_pct': best_sl,
-                    'tp': tp, 'tp_pct': best_tp,
-                    'hold': best_hold,
-                    'shares': shares,
-                    'position': round(shares * entry, 2),
-                    'risk': round(shares * risk_per_share, 2),
-                    'rsi': rsi_val,
-                    'reason': " | ".join(reasons),
+                    'ticker': ticker.replace('.NS', ''), 'name': name, 'market': market,
+                    'price': entry, 'strategies': " + ".join(active), 'count': len(active),
+                    'sl': sl, 'sl_pct': best_sl, 'tp': tp, 'tp_pct': best_tp, 'rr': rr,
+                    'shares': shares, 'position': round(shares * entry, 2),
+                    'risk': round(shares * risk_pt, 2)
                 })
+        except: continue
+        time.sleep(0.5)
 
-        except Exception as e:
-            print(f"Error scanning {ticker}: {e}")
-            continue
-
-        time.sleep(0.5)  # rate limit
-
-    # Sort by strategy count then RSI
-    signals.sort(key=lambda x: (-x['count'], x['rsi']))
-    for i, s in enumerate(signals):
-        s['rank'] = i + 1
-
+    signals.sort(key=lambda x: -x['count'])
     latest_signals = signals[:MAX_OPEN_TRADES]
-    last_scan_time = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
-    scan_status = f"Done — {len(signals)} signals found"
+    last_scan_time = datetime.utcnow().strftime('%b %d, %I:%M %p UTC').upper()
+    scan_status = f"SYSTEM OPTIMAL // {len(signals)} SIGNALS"
 
-    scan_history.append({
-        'time': last_scan_time,
-        'signals': len(signals),
-        'top': signals[0]['ticker'] if signals else "None"
-    })
-
+    scan_history.append({'time': last_scan_time, 'signals': len(signals)})
     return signals
 
-
 # ============================================================
-# HTML DASHBOARD
+# HTML DASHBOARD (JARVIS UI)
 # ============================================================
 
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>📡 Stock Scanner</title>
+    <title>J.A.R.V.I.S. | Stock Radar</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
     <style>
+        :root {
+            --bg-base: #060505;
+            --bg-panel: #0d0a09;
+            --border-dim: #2a1610;
+            --accent-orange: #ff5a00;
+            --accent-green: #00ff66;
+            --accent-red: #ff3333;
+            --text-main: #f0f0f0;
+            --text-dim: #887a75;
+        }
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            background: #0f172a; color: #e2e8f0;
-            padding: 20px; max-width: 1200px; margin: 0 auto;
+            font-family: 'Inter', sans-serif;
+            background: radial-gradient(circle at 50% 0%, #1a0a05 0%, var(--bg-base) 40%);
+            background-color: var(--bg-base);
+            color: var(--text-main);
+            min-height: 100vh; padding: 30px 15px;
         }
-        h1 { color: #38bdf8; margin-bottom: 5px; font-size: 1.8em; }
-        .subtitle { color: #94a3b8; margin-bottom: 20px; font-size: 0.9em; }
-        .status-bar {
-            display: flex; gap: 20px; flex-wrap: wrap;
-            background: #1e293b; padding: 15px 20px;
-            border-radius: 10px; margin-bottom: 20px;
+        .container { max-width: 900px; margin: 0 auto; }
+        
+        /* HEADER */
+        .header {
+            background: var(--bg-panel); border: 1px solid var(--border-dim);
+            border-radius: 12px; padding: 20px;
+            display: flex; justify-content: space-between; align-items: center;
+            margin-bottom: 25px; box-shadow: 0 8px 30px rgba(0,0,0,0.5);
         }
-        .status-item { text-align: center; }
-        .status-label { color: #64748b; font-size: 0.75em; text-transform: uppercase; }
-        .status-value { color: #38bdf8; font-size: 1.2em; font-weight: bold; }
-        .status-value.green { color: #4ade80; }
-        .status-value.yellow { color: #fbbf24; }
-        .status-value.red { color: #f87171; }
-        .btn {
-            background: #2563eb; color: white; border: none;
-            padding: 12px 24px; border-radius: 8px; cursor: pointer;
-            font-size: 1em; font-weight: bold; margin: 10px 0;
-            text-decoration: none; display: inline-block;
+        .logo-area { display: flex; align-items: center; gap: 15px; }
+        .logo-box {
+            background: var(--accent-orange); color: #000;
+            font-weight: 800; font-size: 24px;
+            width: 45px; height: 45px; border-radius: 8px;
+            display: flex; justify-content: center; align-items: center;
+            box-shadow: 0 0 15px rgba(255, 90, 0, 0.4);
         }
-        .btn:hover { background: #1d4ed8; }
-        .btn:disabled { background: #475569; cursor: not-allowed; }
+        .title-area h1 { font-size: 18px; letter-spacing: 1px; color: #fff; }
+        .title-area span { color: var(--accent-orange); font-size: 11px; vertical-align: top; }
+        .title-area p { color: var(--accent-orange); font-size: 12px; margin-top: 2px; letter-spacing: 0.5px; }
+        .live-badge {
+            background: rgba(0, 255, 102, 0.1); border: 1px solid var(--accent-green);
+            color: var(--accent-green); padding: 6px 12px; border-radius: 20px;
+            font-size: 11px; font-weight: 800; letter-spacing: 1px;
+            display: flex; align-items: center; gap: 6px; box-shadow: 0 0 10px rgba(0, 255, 102, 0.2);
+        }
+        .dot { width: 6px; height: 6px; background: var(--accent-green); border-radius: 50%; box-shadow: 0 0 5px var(--accent-green); }
+        
+        /* STATS GRID */
+        .stats-grid {
+            display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin-bottom: 25px;
+        }
+        .stat-card {
+            background: var(--bg-panel); border: 1px solid var(--border-dim);
+            border-radius: 10px; padding: 15px; text-align: center;
+        }
+        .stat-label { color: var(--text-dim); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 5px; }
+        .stat-val { font-family: 'JetBrains Mono', monospace; font-size: 22px; font-weight: 700; }
+        .stat-sub { color: var(--text-dim); font-size: 10px; margin-top: 5px; }
+        .text-orange { color: var(--accent-orange); }
+        .text-white { color: #fff; }
+        
+        /* SECTION HEADER */
+        .section-header {
+            display: flex; justify-content: space-between; align-items: center;
+            border-bottom: 1px solid var(--border-dim); padding-bottom: 8px;
+            margin-bottom: 15px; margin-top: 30px;
+        }
+        .section-header h2 { font-size: 12px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 1.5px; }
+        .section-header span { font-size: 11px; font-weight: 600; color: var(--text-main); }
+        .text-green { color: var(--accent-green); }
+
+        /* RADAR / STANDBY STATE */
+        .radar-box {
+            background: var(--bg-panel); border: 1px solid var(--border-dim);
+            border-radius: 12px; padding: 30px; display: flex; align-items: center; gap: 25px;
+        }
+        .circle-ui {
+            width: 100px; height: 100px; border-radius: 50%;
+            border: 4px solid var(--border-dim); border-top-color: var(--accent-orange);
+            display: flex; justify-content: center; align-items: center; flex-direction: column;
+            box-shadow: 0 0 20px rgba(255, 90, 0, 0.1);
+        }
+        .circle-ui span { font-family: 'JetBrains Mono', monospace; font-size: 20px; font-weight: 700; color: #fff; }
+        .circle-ui small { font-size: 9px; color: var(--text-dim); letter-spacing: 1px; }
+        .radar-text h2 { color: var(--accent-orange); font-size: 20px; margin-bottom: 5px; letter-spacing: 1px; }
+        .radar-text p { color: var(--text-dim); font-size: 12px; margin-bottom: 10px; }
+        .neutral-bar {
+            background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05);
+            border-radius: 6px; padding: 10px 15px; display: flex; align-items: center; gap: 10px;
+        }
+        .neutral-bar span { background: #333; font-size: 10px; padding: 2px 6px; border-radius: 4px; font-weight: bold; }
+        .neutral-bar p { color: #888; font-size: 11px; margin:0; }
+
+        /* SIGNAL CARDS */
         .signal-card {
-            background: #1e293b; border-radius: 12px;
-            padding: 20px; margin-bottom: 15px;
-            border-left: 4px solid #4ade80;
+            background: var(--bg-panel); border: 1px solid var(--border-dim);
+            border-radius: 12px; padding: 20px; margin-bottom: 15px;
         }
-        .signal-card.strong { border-left-color: #f97316; }
-        .signal-card.mega { border-left-color: #ef4444; }
-        .signal-header {
-            display: flex; justify-content: space-between;
-            align-items: center; margin-bottom: 10px;
+        .sig-head { display: flex; justify-content: space-between; border-bottom: 1px solid var(--border-dim); padding-bottom: 12px; margin-bottom: 15px; }
+        .sig-ticker { font-size: 18px; font-weight: 800; color: #fff; letter-spacing: 1px; display: flex; align-items: center; gap: 10px; }
+        .market-tag { background: #222; font-size: 10px; padding: 3px 6px; border-radius: 4px; color: #aaa; }
+        .sig-type { color: var(--accent-orange); font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; }
+        
+        .target-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 15px; }
+        .t-box { background: rgba(0,0,0,0.3); border: 1px solid var(--border-dim); border-radius: 8px; padding: 12px; text-align: center; }
+        .t-label { color: var(--text-dim); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
+        .t-val { font-family: 'JetBrains Mono', monospace; font-size: 16px; font-weight: 700; }
+        
+        .val-red { color: var(--accent-red); }
+        .val-green { color: var(--accent-green); }
+        .val-orange { color: var(--accent-orange); }
+
+        .sig-footer { display: flex; justify-content: space-between; font-size: 11px; color: var(--text-dim); background: rgba(255,255,255,0.02); padding: 10px; border-radius: 6px; }
+        .sig-footer span strong { color: #fff; font-family: 'JetBrains Mono', monospace; }
+
+        /* BUTTON */
+        .btn-scan {
+            width: 100%; background: transparent; border: 1px solid var(--accent-orange);
+            color: var(--accent-orange); padding: 15px; border-radius: 8px;
+            font-size: 14px; font-weight: 600; letter-spacing: 2px; text-transform: uppercase;
+            cursor: pointer; transition: all 0.3s; margin-top: 10px;
         }
-        .signal-ticker { font-size: 1.4em; font-weight: bold; color: #f8fafc; }
-        .signal-badge {
-            background: #22c55e; color: white; padding: 4px 10px;
-            border-radius: 20px; font-size: 0.8em;
-        }
-        .signal-grid {
-            display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-            gap: 10px; margin-top: 10px;
-        }
-        .signal-metric {
-            background: #0f172a; padding: 10px; border-radius: 8px;
-        }
-        .metric-label { color: #64748b; font-size: 0.75em; }
-        .metric-value { color: #e2e8f0; font-size: 1.1em; font-weight: bold; }
-        .metric-value.green { color: #4ade80; }
-        .metric-value.red { color: #f87171; }
-        .no-signals {
-            text-align: center; padding: 60px 20px;
-            background: #1e293b; border-radius: 12px;
-        }
-        .no-signals h2 { color: #64748b; margin-bottom: 10px; }
-        .no-signals p { color: #475569; }
-        .history { margin-top: 30px; }
-        .history h3 { color: #94a3b8; margin-bottom: 10px; }
-        .history-item {
-            background: #1e293b; padding: 10px 15px;
-            border-radius: 8px; margin-bottom: 5px;
-            display: flex; justify-content: space-between;
-            font-size: 0.9em;
-        }
-        .footer {
-            text-align: center; color: #475569;
-            margin-top: 30px; font-size: 0.8em;
+        .btn-scan:hover { background: rgba(255, 90, 0, 0.1); box-shadow: 0 0 15px rgba(255, 90, 0, 0.2); }
+        
+        @media (max-width: 600px) {
+            .stats-grid { grid-template-columns: repeat(2, 1fr); }
+            .target-grid { grid-template-columns: repeat(2, 1fr); }
+            .radar-box { flex-direction: column; text-align: center; }
         }
     </style>
 </head>
 <body>
-    <h1>📡 Stock Scanner Dashboard</h1>
-    <p class="subtitle">3 Winning Strategies × 30 Stocks | Auto-scans daily</p>
-
-    <div class="status-bar">
-        <div class="status-item">
-            <div class="status-label">Last Scan</div>
-            <div class="status-value">{{ last_scan }}</div>
-        </div>
-        <div class="status-item">
-            <div class="status-label">Status</div>
-            <div class="status-value green">{{ status }}</div>
-        </div>
-        <div class="status-item">
-            <div class="status-label">Signals</div>
-            <div class="status-value {% if signal_count > 0 %}green{% else %}yellow{% endif %}">
-                {{ signal_count }}
+    <div class="container">
+        
+        <!-- HEADER -->
+        <div class="header">
+            <div class="logo-area">
+                <div class="logo-box">S</div>
+                <div class="title-area">
+                    <h1>SIGNAL AI <span>v2.0</span></h1>
+                    <p>J.A.R.V.I.S. ENGINE (GLOBAL)</p>
+                </div>
+            </div>
+            <div class="live-badge">
+                <div class="dot"></div> LIVE
             </div>
         </div>
-        <div class="status-item">
-            <div class="status-label">Account</div>
-            <div class="status-value">${{ "{:,.0f}".format(account) }}</div>
-        </div>
-        <div class="status-item">
-            <div class="status-label">Risk/Trade</div>
-            <div class="status-value">{{ risk }}%</div>
-        </div>
-    </div>
 
-    <a href="/scan" class="btn">🔄 Run Scan Now</a>
-    <a href="/api/signals" class="btn" style="background:#475569">📊 API (JSON)</a>
-
-    <h2 style="margin: 20px 0 10px; color: #94a3b8;">
-        🎯 Active Signals (Top {{ max_trades }})
-    </h2>
-
-    {% if signals %}
-        {% for s in signals %}
-        <div class="signal-card {% if s.count >= 3 %}mega{% elif s.count >= 2 %}strong{% endif %}">
-            <div class="signal-header">
-                <span class="signal-ticker">
-                    {{ s.market }} #{{ s.rank }} {{ s.ticker }}
-                    <span style="color:#94a3b8; font-size:0.7em">{{ s.name }}</span>
-                </span>
-                <span class="signal-badge">
-                    {% if s.count >= 3 %}🔥🔥🔥{% elif s.count >= 2 %}🔥🔥{% else %}🔥{% endif %}
-                    {{ s.count }} strategies
-                </span>
+        <!-- STATS -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-label">System Status</div>
+                <div class="stat-val text-white" style="font-size:16px; margin-top:4px;">{{ status }}</div>
+                <div class="stat-sub">Auto-Scan Active</div>
             </div>
-            <p style="color:#94a3b8; font-size:0.85em; margin-bottom:10px">
-                {{ s.strategies }} — {{ s.reason }}
-            </p>
-            <div class="signal-grid">
-                <div class="signal-metric">
-                    <div class="metric-label">Entry Price</div>
-                    <div class="metric-value">${{ "%.2f"|format(s.price) }}</div>
+            <div class="stat-card">
+                <div class="stat-label">Active Signals</div>
+                <div class="stat-val text-orange">{{ signal_count }}</div>
+                <div class="stat-sub">Max: {{ max_trades }} limit</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Capital Auth</div>
+                <div class="stat-val text-white">${{ "{:,.0f}".format(account/1000) }}K</div>
+                <div class="stat-sub">Spot Account</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Risk Per Trade</div>
+                <div class="stat-val text-white">{{ risk }}%</div>
+                <div class="stat-sub">Strict Limit</div>
+            </div>
+        </div>
+
+        <div class="section-header">
+            <h2>System Consensus Radar (Last Scan)</h2>
+            <span>SOURCE <span class="text-white">YAHOO.FINANCE</span></span>
+        </div>
+
+        <!-- SIGNALS OR STANDBY -->
+        {% if signals %}
+            {% for s in signals %}
+            <div class="signal-card">
+                <div class="sig-head">
+                    <div class="sig-ticker">
+                        {{ s.ticker }} <span class="market-tag">{{ s.market }}</span>
+                    </div>
+                    <div class="sig-type">{{ s.strategies }}</div>
                 </div>
-                <div class="signal-metric">
-                    <div class="metric-label">Stop Loss</div>
-                    <div class="metric-value red">${{ "%.2f"|format(s.sl) }} (-{{ s.sl_pct }}%)</div>
+                <div class="target-grid">
+                    <div class="t-box">
+                        <div class="t-label">Entry</div>
+                        <div class="t-val text-white">${{ "%.2f"|format(s.price) }}</div>
+                    </div>
+                    <div class="t-box">
+                        <div class="t-label">Stop Loss</div>
+                        <div class="t-val val-red">-{{ s.sl_pct }}%</div>
+                    </div>
+                    <div class="t-box">
+                        <div class="t-label">Target</div>
+                        <div class="t-val val-green">+{{ s.tp_pct }}%</div>
+                    </div>
+                    <div class="t-box">
+                        <div class="t-label">R:R</div>
+                        <div class="t-val val-orange">1 : {{ s.rr }}</div>
+                    </div>
                 </div>
-                <div class="signal-metric">
-                    <div class="metric-label">Take Profit</div>
-                    <div class="metric-value green">${{ "%.2f"|format(s.tp) }} (+{{ s.tp_pct }}%)</div>
+                <div class="sig-footer">
+                    <span>Alloc: <strong>${{ "{:,.0f}".format(s.position) }}</strong> ({{ s.shares }} sh)</span>
+                    <span>Risk: <strong>${{ "{:,.0f}".format(s.risk) }}</strong></span>
                 </div>
-                <div class="signal-metric">
-                    <div class="metric-label">Max Hold</div>
-                    <div class="metric-value">{{ s.hold }} days</div>
+            </div>
+            {% endfor %}
+        {% else %}
+            <div class="radar-box">
+                <div class="circle-ui">
+                    <span>0%</span>
+                    <small>CONSENSUS</small>
                 </div>
-                <div class="signal-metric">
-                    <div class="metric-label">Shares</div>
-                    <div class="metric-value">{{ s.shares }}</div>
-                </div>
-                <div class="signal-metric">
-                    <div class="metric-label">Position</div>
-                    <div class="metric-value">${{ "{:,.0f}".format(s.position) }}</div>
-                </div>
-                <div class="signal-metric">
-                    <div class="metric-label">Risk</div>
-                    <div class="metric-value red">${{ "{:,.0f}".format(s.risk) }}</div>
-                </div>
-                <div class="signal-metric">
-                    <div class="metric-label">RSI</div>
-                    <div class="metric-value {% if s.rsi < 30 %}green{% elif s.rsi > 70 %}red{% endif %}">
-                        {{ s.rsi }}
+                <div class="radar-text">
+                    <h2>STANDBY // NO SIGNAL</h2>
+                    <p>Threshold: 2+ Strategy Confluence<br>Last Scan: {{ last_scan }}</p>
+                    <div class="neutral-bar">
+                        <span>N</span>
+                        <p>NEUTRAL - No Position / Vetoed</p>
                     </div>
                 </div>
             </div>
-        </div>
-        {% endfor %}
-    {% else %}
-        <div class="no-signals">
-            <h2>😴 No Signals Today</h2>
-            <p>Market is quiet. Sitting in cash is a valid position.</p>
-            <p style="margin-top:10px">The scanner checks for 2+ strategies agreeing.<br>
-            Good trades don't happen every day — that's the point.</p>
-        </div>
-    {% endif %}
+        {% endif %}
 
-    {% if history %}
-    <div class="history">
-        <h3>📜 Scan History</h3>
-        {% for h in history[-10:]|reverse %}
-        <div class="history-item">
-            <span>{{ h.time }}</span>
-            <span>{{ h.signals }} signals | Top: {{ h.top }}</span>
-        </div>
-        {% endfor %}
-    </div>
-    {% endif %}
+        <button class="btn-scan" onclick="triggerScan()" id="scanBtn">INITIATE MANUAL SCAN</button>
 
-    <div class="footer">
-        <p>Strategies: Weekly Momentum | BB Bounce | 5% Drop Buy</p>
-        <p>Auto-refreshes when triggered by cron job. Account: ${{ "{:,.0f}".format(account) }}</p>
     </div>
+
+    <script>
+        function triggerScan() {
+            const btn = document.getElementById('scanBtn');
+            btn.innerText = "SCANNING SYSTEM...";
+            btn.style.opacity = "0.5";
+            btn.disabled = true;
+            fetch('/scan').then(() => {
+                setTimeout(() => window.location.reload(), 3000);
+            });
+        }
+    </script>
 </body>
 </html>
 """
-
 
 # ============================================================
 # ROUTES
@@ -422,58 +416,25 @@ def dashboard():
         DASHBOARD_HTML,
         signals=latest_signals,
         last_scan=last_scan_time,
-        status=scan_status,
+        status="OPTIMAL" if latest_signals else "IDLE",
         signal_count=len(latest_signals),
         account=ACCOUNT_SIZE,
         risk=RISK_PER_TRADE * 100,
-        max_trades=MAX_OPEN_TRADES,
-        history=scan_history,
+        max_trades=MAX_OPEN_TRADES
     )
-
 
 @app.route('/scan')
 def trigger_scan():
-    """Trigger a new scan (called by cron job or manually)."""
-    def do_scan():
-        run_scan()
-    thread = threading.Thread(target=do_scan)
-    thread.start()
-    return jsonify({
-        "status": "Scan started",
-        "message": "Results will be ready in ~60 seconds. Refresh the dashboard."
-    })
-
-
-@app.route('/api/signals')
-def api_signals():
-    """JSON API for signals."""
-    return jsonify({
-        "last_scan": last_scan_time,
-        "status": scan_status,
-        "signal_count": len(latest_signals),
-        "signals": latest_signals,
-        "history": scan_history[-20:],
-    })
-
+    threading.Thread(target=run_scan).start()
+    return jsonify({"status": "Scan initiated"})
 
 @app.route('/health')
-def health():
-    """Health check for Render."""
-    return "OK", 200
-
-
-# ============================================================
-# STARTUP
-# ============================================================
+def health(): return "OK", 200
 
 def startup_scan():
-    """Run initial scan when app starts."""
-    time.sleep(5)  # wait for Flask to fully start
-    print("🚀 Running startup scan...")
+    time.sleep(3)
     run_scan()
-    print(f"✅ Startup scan complete: {len(latest_signals)} signals")
 
 if __name__ == '__main__':
-    # Run startup scan in background
     threading.Thread(target=startup_scan, daemon=True).start()
     app.run(host='0.0.0.0', port=10000)
