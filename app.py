@@ -1,440 +1,519 @@
-# ============================================================
-# STOCK SCANNER — UI Upgrade (JARVIS Edition)
-# Flask app with dashboard + daily scan endpoint
-# ============================================================
-
+import flask
 from flask import Flask, render_template_string, jsonify
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime
-import threading
-import time
-import warnings
-warnings.filterwarnings('ignore')
+import datetime
 
 app = Flask(__name__)
 
-# ============================================================
-# GLOBAL STATE
-# ============================================================
+# Target Watchlist
+WATCHLIST = [
+    # US Tech & Growth
+    "AAPL", "NVDA", "TSLA", "AMD", "MSFT", "AMZN", "GOOGL", "META",
+    # Indian Bluechips
+    "HCLTECH.NS", "TCS.NS", "BHARTIARTL.NS", "RELIANCE.NS", "INFY.NS"
+]
 
-latest_signals = []
-scan_history = []
-last_scan_time = "STANDBY"
-scan_status = "System Idle"
+def analyze_stock(symbol):
+    try:
+        df = yf.download(symbol, period="1y", interval="1d", progress=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+            
+        if len(df) < 60:
+            return None, []
+            
+        # Standard Indicators
+        df['SMA_20'] = df['Close'].rolling(window=20).mean()
+        df['SMA_50'] = df['Close'].rolling(window=50).mean()
+        df['STD_20'] = df['Close'].rolling(window=20).std()
+        df['BB_Upper'] = df['SMA_20'] + (df['STD_20'] * 2)
+        df['BB_Lower'] = df['SMA_20'] - (df['STD_20'] * 2)
+        df['Vol_SMA20'] = df['Volume'].rolling(window=20).mean()
+        
+        # Strategy Metrics
+        df['Return_5d'] = (df['Close'] - df['Close'].shift(5)) / df['Close'].shift(5) * 100
+        df['Drop_3d'] = (df['Close'] - df['Close'].shift(3)) / df['Close'].shift(3) * 100
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+        # ATR Calculation
+        df['TR'] = np.maximum(
+            df['High'] - df['Low'],
+            np.maximum(
+                abs(df['High'] - df['Close'].shift(1)),
+                abs(df['Low'] - df['Close'].shift(1))
+            )
+        )
+        df['ATR'] = df['TR'].rolling(window=14).mean()
 
-ACCOUNT_SIZE = 100000
-RISK_PER_TRADE = 0.02
-MAX_OPEN_TRADES = 5
-MIN_SIGNAL_STRENGTH = 2
+        # -------------------------------------------------------------
+        # 1. LIVE SIGNAL SCANNER
+        # -------------------------------------------------------------
+        latest = df.iloc[-1]
+        prev = df.iloc[-2]
+        
+        signals = []
+        if latest['Return_5d'] >= 5.0 and latest['Close'] > latest['SMA_20']:
+            signals.append("Weekly Momentum")
+        if prev['Low'] <= prev['BB_Lower'] and latest['Close'] > latest['Open']:
+            signals.append("BB Lower Bounce")
+        if prev['Drop_3d'] <= -5.0 and latest['Close'] > latest['Open']:
+            signals.append("5% Dip Buy")
 
-STOCKS = {
-    "AAPL": "Apple", "MSFT": "Microsoft", "GOOGL": "Alphabet",
-    "AMZN": "Amazon", "NVDA": "Nvidia", "META": "Meta",
-    "TSLA": "Tesla", "JPM": "JP Morgan", "V": "Visa",
-    "CRM": "Salesforce", "AMD": "AMD", "NFLX": "Netflix",
-    "SPY": "S&P 500", "QQQ": "Nasdaq 100", "IWM": "Russell 2000",
-    "XLF": "Financials", "XLE": "Energy", "XLK": "Tech",
-    "RELIANCE.NS": "Reliance", "TCS.NS": "TCS",
-    "HDFCBANK.NS": "HDFC Bank", "INFY.NS": "Infosys",
-    "ICICIBANK.NS": "ICICI Bank", "SBIN.NS": "SBI",
-    "BHARTIARTL.NS": "Bharti Airtel", "ITC.NS": "ITC",
-    "HCLTECH.NS": "HCL Tech", "BAJFINANCE.NS": "Bajaj",
-    "WIPRO.NS": "Wipro", "TATASTEEL.NS": "Tata Steel",
-}
+        live_result = None
+        if signals:
+            entry = float(latest['Close'])
+            atr = float(latest['ATR']) if not np.isnan(latest['ATR']) else entry * 0.03
+            sl = round(entry - (1.5 * atr), 2)
+            tp = round(entry + (3.0 * atr), 2)
+            rr_ratio = round((tp - entry) / (entry - sl), 2) if (entry - sl) > 0 else 2.0
+            
+            live_result = {
+                "symbol": symbol,
+                "price": round(entry, 2),
+                "signals": signals,
+                "sl": sl,
+                "tp": tp,
+                "rr_ratio": f"1:{rr_ratio}",
+                "date": latest.name.strftime('%Y-%m-%d')
+            }
 
-STRATEGY_PARAMS = {
-    "Weekly Momentum": {"sl": 8, "tp": 15, "hold": 25},
-    "BB Bounce":       {"sl": 5, "tp": 10, "hold": 15},
-    "5% Drop Buy":     {"sl": 5, "tp": 10, "hold": 15},
-}
-
-# ============================================================
-# INDICATORS & STRATEGIES
-# ============================================================
-
-def add_indicators(df):
-    d = df.copy()
-    delta = d['Close'].diff()
-    gain = delta.where(delta > 0, 0).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    d['RSI'] = 100 - (100 / (1 + gain / loss.replace(0, 0.001)))
-    d['BB_Mid'] = d['Close'].rolling(20).mean()
-    d['BB_Lower'] = d['BB_Mid'] - 2 * d['Close'].rolling(20).std()
-    d['ROC_3'] = d['Close'].pct_change(3) * 100
-    d['ROC_5'] = d['Close'].pct_change(5) * 100
-    return d
-
-def check_weekly_momentum(d):
-    return d['ROC_5'].iloc[-1] > 5, "5d Mom > 5%"
-
-def check_bb_bounce(d):
-    i = len(d) - 1
-    touched = d['Low'].iloc[i] <= d['BB_Lower'].iloc[i] * 1.01
-    bounce = d['Close'].iloc[i] > d['BB_Lower'].iloc[i]
-    near = d['Low'].iloc[i-1] <= d['BB_Lower'].iloc[i-1] * 1.02 if i > 0 else False
-    return (touched and bounce) or (near and bounce), "BB Bounce"
-
-def check_drop_buy(d):
-    i = len(d) - 1
-    if i < 2: return False, ""
-    dropped = d['ROC_3'].iloc[i-1] < -5 or d['ROC_3'].iloc[i] < -5
-    bouncing = d['Close'].iloc[i] > d['Close'].iloc[i-1]
-    return dropped and bouncing, "5% Drop Buy"
-
-STRATEGIES = [("Weekly Momentum", check_weekly_momentum), ("BB Bounce", check_bb_bounce), ("5% Drop Buy", check_drop_buy)]
-
-# ============================================================
-# SCANNER CORE
-# ============================================================
-
-def run_scan():
-    global latest_signals, last_scan_time, scan_status
-    scan_status = "SCANNING NETWORK..."
-    signals = []
-
-    for ticker, name in STOCKS.items():
-        market = "IND" if ".NS" in ticker else "USA"
-        try:
-            df = yf.download(ticker, period="6mo", interval="1d", progress=False)
-            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-            if len(df) < 50: continue
-            df = df[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
-            d = add_indicators(df)
-
-            active, reasons = [], []
-            for sname, sfunc in STRATEGIES:
-                triggered, reason = sfunc(d)
-                if triggered:
-                    active.append(sname)
-                    reasons.append(reason)
-
-            if len(active) >= MIN_SIGNAL_STRENGTH:
-                entry = round(float(d['Close'].iloc[-1]), 2)
-                best_sl = min(STRATEGY_PARAMS[s]['sl'] for s in active)
-                best_tp = max(STRATEGY_PARAMS[s]['tp'] for s in active)
+        # -------------------------------------------------------------
+        # 2. HISTORICAL 6-MONTH AUTOPSY ENGINE
+        # -------------------------------------------------------------
+        history_signals = []
+        lookback_days = 126
+        start_idx = max(20, len(df) - lookback_days)
+        
+        for i in range(start_idx, len(df) - 1):
+            row = df.iloc[i]
+            prev_row = df.iloc[i-1]
+            
+            h_signals = []
+            if row['Return_5d'] >= 5.0 and row['Close'] > row['SMA_20']:
+                h_signals.append("Weekly Momentum")
+            if prev_row['Low'] <= prev_row['BB_Lower'] and row['Close'] > row['Open']:
+                h_signals.append("BB Bounce")
+            if prev_row['Drop_3d'] <= -5.0 and row['Close'] > row['Open']:
+                h_signals.append("Dip Buy")
                 
-                sl = round(entry * (1 - best_sl / 100), 2)
-                tp = round(entry * (1 + best_tp / 100), 2)
+            if h_signals:
+                entry_price = float(row['Close'])
+                atr = float(row['ATR']) if not np.isnan(row['ATR']) else entry_price * 0.03
                 
-                # Risk Reward Math
-                risk_pt = entry - sl
-                reward_pt = tp - entry
-                rr = round(reward_pt / risk_pt, 2) if risk_pt > 0 else 0
+                risk = 1.5 * atr
+                reward = 3.0 * atr
+                sl_price = round(entry_price - risk, 2)
+                tp_price = round(entry_price + reward, 2)
+                initial_rr = round(reward / risk, 1) if risk > 0 else 2.0
+                
+                # Forward simulation up to 25 trading days
+                forward_df = df.iloc[i+1 : min(i+26, len(df))]
+                status = "EXPIRED"
+                autopsy = ""
+                days_held = len(forward_df)
+                return_pct = round((forward_df.iloc[-1]['Close'] - entry_price) / entry_price * 100, 1) if days_held > 0 else 0.0
+                
+                peak_high = entry_price
+                trough_low = entry_price
+                exit_day = 0
+                
+                for idx, (_, f_row) in enumerate(forward_df.iterrows()):
+                    if f_row['High'] > peak_high:
+                        peak_high = f_row['High']
+                    if f_row['Low'] < trough_low:
+                        trough_low = f_row['Low']
+                        
+                    if f_row['High'] >= tp_price and status == "EXPIRED":
+                        status = "WIN"
+                        exit_day = idx + 1
+                        return_pct = round((tp_price - entry_price) / entry_price * 100, 1)
+                    elif f_row['Low'] <= sl_price and status == "EXPIRED":
+                        status = "LOSS"
+                        exit_day = idx + 1
+                        return_pct = round((sl_price - entry_price) / entry_price * 100, 1)
 
-                risk_amt = ACCOUNT_SIZE * RISK_PER_TRADE
-                shares = int(risk_amt / risk_pt) if risk_pt > 0 else 0
-
-                signals.append({
-                    'ticker': ticker.replace('.NS', ''), 'name': name, 'market': market,
-                    'price': entry, 'strategies': " + ".join(active), 'count': len(active),
-                    'sl': sl, 'sl_pct': best_sl, 'tp': tp, 'tp_pct': best_tp, 'rr': rr,
-                    'shares': shares, 'position': round(shares * entry, 2),
-                    'risk': round(shares * risk_pt, 2)
+                # --- AUTOPSY DIAGNOSTIC GENERATOR ---
+                if status == "WIN":
+                    # Check post-target max extension
+                    max_rr = round((peak_high - entry_price) / risk, 1) if risk > 0 else initial_rr
+                    extra_pct = round(((peak_high - tp_price) / entry_price) * 100, 1)
+                    if extra_pct > 1.0:
+                        autopsy = f"🎯 Target hit in {exit_day}d. Extended +{extra_pct}% further (Peak R:R reached 1:{max_rr})."
+                    else:
+                        autopsy = f"🎯 Target hit in {exit_day}d. Exact hit before momentum faded."
+                        
+                elif status == "LOSS":
+                    # Diagnose what went wrong
+                    loss_rows = forward_df[forward_df['Low'] <= sl_price]
+                    exit_bar = loss_rows.iloc[0] if len(loss_rows) > 0 else forward_df.iloc[-1]
+                    
+                    reasons = []
+                    if exit_bar['Open'] < sl_price:
+                        reasons.append("Sharp Gap-Down Slippage")
+                    if row['Close'] < row['SMA_50']:
+                        reasons.append("Trend Failure (Trading below 50-SMA)")
+                    if 'Vol_SMA20' in row and exit_bar['Volume'] > (1.5 * row['Vol_SMA20']):
+                        reasons.append("High Institutional Volume Selling")
+                    
+                    if not reasons:
+                        reasons.append("Market Noise / Stop-loss Hunt")
+                        
+                    autopsy = f"🛑 SL Hit in {exit_day}d. Diagnostic: {', '.join(reasons)}."
+                    
+                else: # EXPIRED
+                    autopsy = f"⏳ Held 25 days sideways. Net PnL: {return_pct}%. No SL/TP hit."
+                
+                history_signals.append({
+                    "symbol": symbol,
+                    "date": row.name.strftime('%Y-%m-%d'),
+                    "strategies": ", ".join(h_signals),
+                    "entry": round(entry_price, 2),
+                    "sl": sl_price,
+                    "tp": tp_price,
+                    "initial_rr": f"1:{initial_rr}",
+                    "status": status,
+                    "return_pct": return_pct,
+                    "autopsy": autopsy
                 })
-        except: continue
-        time.sleep(0.5)
+                
+        return live_result, history_signals
 
-    signals.sort(key=lambda x: -x['count'])
-    latest_signals = signals[:MAX_OPEN_TRADES]
-    last_scan_time = datetime.utcnow().strftime('%b %d, %I:%M %p UTC').upper()
-    scan_status = f"SYSTEM OPTIMAL // {len(signals)} SIGNALS"
+    except Exception as e:
+        print(f"Error analyzing {symbol}: {e}")
+        return None, []
 
-    scan_history.append({'time': last_scan_time, 'signals': len(signals)})
-    return signals
+@app.route('/')
+def home():
+    return render_template_string(HTML_TEMPLATE)
 
-# ============================================================
-# HTML DASHBOARD (JARVIS UI)
-# ============================================================
+@app.route('/scan')
+def scan():
+    live_signals = []
+    historical_logs = []
+    
+    for symbol in WATCHLIST:
+        live_res, hist_res = analyze_stock(symbol)
+        if live_res:
+            live_signals.append(live_res)
+        if hist_res:
+            historical_logs.extend(hist_res)
+            
+    total_trades = len(historical_logs)
+    wins = len([x for x in historical_logs if x['status'] == 'WIN'])
+    losses = len([x for x in historical_logs if x['status'] == 'LOSS'])
+    win_rate = round((wins / total_trades) * 100, 1) if total_trades > 0 else 0
+    avg_return = round(sum([x['return_pct'] for x in historical_logs]) / total_trades, 1) if total_trades > 0 else 0
 
-DASHBOARD_HTML = """
+    return jsonify({
+        "timestamp": datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC'),
+        "live_signals": live_signals,
+        "historical_stats": {
+            "total_trades": total_trades,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": win_rate,
+            "avg_return": avg_return
+        },
+        "historical_logs": sorted(historical_logs, key=lambda x: x['date'], reverse=True)[:35]
+    })
+
+HTML_TEMPLATE = """
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>J.A.R.V.I.S. | Stock Radar</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JARVIS Scanner & Signal Autopsy</title>
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg-base: #060505;
-            --bg-panel: #0d0a09;
-            --border-dim: #2a1610;
-            --accent-orange: #ff5a00;
-            --accent-green: #00ff66;
-            --accent-red: #ff3333;
-            --text-main: #f0f0f0;
-            --text-dim: #887a75;
+            --bg-color: #08090c;
+            --panel-bg: #0f1117;
+            --border-color: #1e222d;
+            --neon-orange: #ff6600;
+            --neon-orange-glow: rgba(255, 102, 0, 0.3);
+            --text-color: #e1e3e6;
+            --text-dim: #787b86;
+            --green: #00e676;
+            --red: #ff5252;
         }
-        * { margin: 0; padding: 0; box-sizing: border-box; }
+
         body {
-            font-family: 'Inter', sans-serif;
-            background: radial-gradient(circle at 50% 0%, #1a0a05 0%, var(--bg-base) 40%);
-            background-color: var(--bg-base);
-            color: var(--text-main);
-            min-height: 100vh; padding: 30px 15px;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            font-family: 'Rajdhani', sans-serif;
+            margin: 0;
+            padding: 20px;
         }
-        .container { max-width: 900px; margin: 0 auto; }
-        
-        /* HEADER */
+
         .header {
-            background: var(--bg-panel); border: 1px solid var(--border-dim);
-            border-radius: 12px; padding: 20px;
-            display: flex; justify-content: space-between; align-items: center;
-            margin-bottom: 25px; box-shadow: 0 8px 30px rgba(0,0,0,0.5);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 2px solid var(--neon-orange);
+            padding-bottom: 15px;
+            margin-bottom: 25px;
+            box-shadow: 0 4px 20px var(--neon-orange-glow);
         }
-        .logo-area { display: flex; align-items: center; gap: 15px; }
-        .logo-box {
-            background: var(--accent-orange); color: #000;
-            font-weight: 800; font-size: 24px;
-            width: 45px; height: 45px; border-radius: 8px;
-            display: flex; justify-content: center; align-items: center;
-            box-shadow: 0 0 15px rgba(255, 90, 0, 0.4);
-        }
-        .title-area h1 { font-size: 18px; letter-spacing: 1px; color: #fff; }
-        .title-area span { color: var(--accent-orange); font-size: 11px; vertical-align: top; }
-        .title-area p { color: var(--accent-orange); font-size: 12px; margin-top: 2px; letter-spacing: 0.5px; }
-        .live-badge {
-            background: rgba(0, 255, 102, 0.1); border: 1px solid var(--accent-green);
-            color: var(--accent-green); padding: 6px 12px; border-radius: 20px;
-            font-size: 11px; font-weight: 800; letter-spacing: 1px;
-            display: flex; align-items: center; gap: 6px; box-shadow: 0 0 10px rgba(0, 255, 102, 0.2);
-        }
-        .dot { width: 6px; height: 6px; background: var(--accent-green); border-radius: 50%; box-shadow: 0 0 5px var(--accent-green); }
-        
-        /* STATS GRID */
-        .stats-grid {
-            display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin-bottom: 25px;
-        }
-        .stat-card {
-            background: var(--bg-panel); border: 1px solid var(--border-dim);
-            border-radius: 10px; padding: 15px; text-align: center;
-        }
-        .stat-label { color: var(--text-dim); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 5px; }
-        .stat-val { font-family: 'JetBrains Mono', monospace; font-size: 22px; font-weight: 700; }
-        .stat-sub { color: var(--text-dim); font-size: 10px; margin-top: 5px; }
-        .text-orange { color: var(--accent-orange); }
-        .text-white { color: #fff; }
-        
-        /* SECTION HEADER */
-        .section-header {
-            display: flex; justify-content: space-between; align-items: center;
-            border-bottom: 1px solid var(--border-dim); padding-bottom: 8px;
-            margin-bottom: 15px; margin-top: 30px;
-        }
-        .section-header h2 { font-size: 12px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 1.5px; }
-        .section-header span { font-size: 11px; font-weight: 600; color: var(--text-main); }
-        .text-green { color: var(--accent-green); }
 
-        /* RADAR / STANDBY STATE */
-        .radar-box {
-            background: var(--bg-panel); border: 1px solid var(--border-dim);
-            border-radius: 12px; padding: 30px; display: flex; align-items: center; gap: 25px;
+        .title-box h1 {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 26px;
+            color: var(--neon-orange);
+            margin: 0;
+            letter-spacing: 2px;
+            text-shadow: 0 0 10px var(--neon-orange-glow);
         }
-        .circle-ui {
-            width: 100px; height: 100px; border-radius: 50%;
-            border: 4px solid var(--border-dim); border-top-color: var(--accent-orange);
-            display: flex; justify-content: center; align-items: center; flex-direction: column;
-            box-shadow: 0 0 20px rgba(255, 90, 0, 0.1);
-        }
-        .circle-ui span { font-family: 'JetBrains Mono', monospace; font-size: 20px; font-weight: 700; color: #fff; }
-        .circle-ui small { font-size: 9px; color: var(--text-dim); letter-spacing: 1px; }
-        .radar-text h2 { color: var(--accent-orange); font-size: 20px; margin-bottom: 5px; letter-spacing: 1px; }
-        .radar-text p { color: var(--text-dim); font-size: 12px; margin-bottom: 10px; }
-        .neutral-bar {
-            background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05);
-            border-radius: 6px; padding: 10px 15px; display: flex; align-items: center; gap: 10px;
-        }
-        .neutral-bar span { background: #333; font-size: 10px; padding: 2px 6px; border-radius: 4px; font-weight: bold; }
-        .neutral-bar p { color: #888; font-size: 11px; margin:0; }
 
-        /* SIGNAL CARDS */
-        .signal-card {
-            background: var(--bg-panel); border: 1px solid var(--border-dim);
-            border-radius: 12px; padding: 20px; margin-bottom: 15px;
-        }
-        .sig-head { display: flex; justify-content: space-between; border-bottom: 1px solid var(--border-dim); padding-bottom: 12px; margin-bottom: 15px; }
-        .sig-ticker { font-size: 18px; font-weight: 800; color: #fff; letter-spacing: 1px; display: flex; align-items: center; gap: 10px; }
-        .market-tag { background: #222; font-size: 10px; padding: 3px 6px; border-radius: 4px; color: #aaa; }
-        .sig-type { color: var(--accent-orange); font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; }
-        
-        .target-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 15px; }
-        .t-box { background: rgba(0,0,0,0.3); border: 1px solid var(--border-dim); border-radius: 8px; padding: 12px; text-align: center; }
-        .t-label { color: var(--text-dim); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
-        .t-val { font-family: 'JetBrains Mono', monospace; font-size: 16px; font-weight: 700; }
-        
-        .val-red { color: var(--accent-red); }
-        .val-green { color: var(--accent-green); }
-        .val-orange { color: var(--accent-orange); }
-
-        .sig-footer { display: flex; justify-content: space-between; font-size: 11px; color: var(--text-dim); background: rgba(255,255,255,0.02); padding: 10px; border-radius: 6px; }
-        .sig-footer span strong { color: #fff; font-family: 'JetBrains Mono', monospace; }
-
-        /* BUTTON */
         .btn-scan {
-            width: 100%; background: transparent; border: 1px solid var(--accent-orange);
-            color: var(--accent-orange); padding: 15px; border-radius: 8px;
-            font-size: 14px; font-weight: 600; letter-spacing: 2px; text-transform: uppercase;
-            cursor: pointer; transition: all 0.3s; margin-top: 10px;
+            background: linear-gradient(135deg, #ff6600, #b34700);
+            color: #fff;
+            border: none;
+            padding: 12px 28px;
+            font-family: 'Orbitron', sans-serif;
+            font-weight: 700;
+            border-radius: 4px;
+            cursor: pointer;
+            box-shadow: 0 0 15px var(--neon-orange-glow);
+            transition: all 0.3s ease;
         }
-        .btn-scan:hover { background: rgba(255, 90, 0, 0.1); box-shadow: 0 0 15px rgba(255, 90, 0, 0.2); }
-        
-        @media (max-width: 600px) {
-            .stats-grid { grid-template-columns: repeat(2, 1fr); }
-            .target-grid { grid-template-columns: repeat(2, 1fr); }
-            .radar-box { flex-direction: column; text-align: center; }
+
+        .btn-scan:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 0 25px rgba(255, 102, 0, 0.6);
+        }
+
+        .section-title {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 18px;
+            color: var(--neon-orange);
+            margin: 30px 0 15px 0;
+            letter-spacing: 1.5px;
+            border-left: 4px solid var(--neon-orange);
+            padding-left: 10px;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 15px;
+            margin-bottom: 25px;
+        }
+
+        .stat-card {
+            background: var(--panel-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 15px;
+            text-align: center;
+        }
+
+        .stat-value {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 24px;
+            font-weight: 700;
+            color: var(--neon-orange);
+            margin-top: 5px;
+        }
+
+        .stat-label {
+            color: var(--text-dim);
+            font-size: 13px;
+            text-transform: uppercase;
+        }
+
+        .table-container {
+            background: var(--panel-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            overflow-x: auto;
+            margin-bottom: 30px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+        }
+
+        th {
+            background: #141721;
+            padding: 14px;
+            font-family: 'Orbitron', sans-serif;
+            font-size: 12px;
+            color: var(--neon-orange);
+            border-bottom: 1px solid var(--border-color);
+            text-transform: uppercase;
+        }
+
+        td {
+            padding: 14px;
+            border-bottom: 1px solid var(--border-color);
+            font-size: 14px;
+        }
+
+        tr:hover {
+            background: rgba(255, 102, 0, 0.03);
+        }
+
+        .badge-win { color: var(--green); font-weight: 700; background: rgba(0, 230, 118, 0.1); padding: 4px 8px; border-radius: 4px; }
+        .badge-loss { color: var(--red); font-weight: 700; background: rgba(255, 82, 82, 0.1); padding: 4px 8px; border-radius: 4px; }
+        .badge-exp { color: var(--text-dim); background: rgba(120, 123, 134, 0.1); padding: 4px 8px; border-radius: 4px; }
+
+        #loader {
+            display: none;
+            color: var(--neon-orange);
+            font-weight: bold;
+            font-family: 'Orbitron', sans-serif;
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        
-        <!-- HEADER -->
-        <div class="header">
-            <div class="logo-area">
-                <div class="logo-box">S</div>
-                <div class="title-area">
-                    <h1>SIGNAL AI <span>v2.0</span></h1>
-                    <p>J.A.R.V.I.S. ENGINE (GLOBAL)</p>
-                </div>
-            </div>
-            <div class="live-badge">
-                <div class="dot"></div> LIVE
-            </div>
+
+    <div class="header">
+        <div class="title-box">
+            <h1>JARVIS QUANT SCANNER</h1>
+            <div style="font-size: 12px; color: var(--text-dim); margin-top: 4px;">LIVE SIGNALS & 6-MONTH AUTOPSY RADAR</div>
         </div>
-
-        <!-- STATS -->
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-label">System Status</div>
-                <div class="stat-val text-white" style="font-size:16px; margin-top:4px;">{{ status }}</div>
-                <div class="stat-sub">Auto-Scan Active</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Active Signals</div>
-                <div class="stat-val text-orange">{{ signal_count }}</div>
-                <div class="stat-sub">Max: {{ max_trades }} limit</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Capital Auth</div>
-                <div class="stat-val text-white">${{ "{:,.0f}".format(account/1000) }}K</div>
-                <div class="stat-sub">Spot Account</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Risk Per Trade</div>
-                <div class="stat-val text-white">{{ risk }}%</div>
-                <div class="stat-sub">Strict Limit</div>
-            </div>
+        <div>
+            <span id="loader">RUNNING SCAN ENGINE...</span>
+            <button class="btn-scan" onclick="runScan()">EXECUTE SCAN</button>
         </div>
+    </div>
 
-        <div class="section-header">
-            <h2>System Consensus Radar (Last Scan)</h2>
-            <span>SOURCE <span class="text-white">YAHOO.FINANCE</span></span>
+    <!-- LIVE SIGNALS SECTION -->
+    <div class="section-title">TODAY'S LIVE TRADE SIGNALS</div>
+    <div class="table-container">
+        <table>
+            <thead>
+                <tr>
+                    <th>Symbol</th>
+                    <th>Signal Date</th>
+                    <th>Entry Price</th>
+                    <th>Signals Triggered</th>
+                    <th>Stop Loss</th>
+                    <th>Target (TP)</th>
+                    <th>Initial R:R</th>
+                </tr>
+            </thead>
+            <tbody id="live-table-body">
+                <tr><td colspan="7" style="text-align:center; color: var(--text-dim);">Click 'EXECUTE SCAN' to fetch live market signals.</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <!-- HISTORICAL AUDIT STATS -->
+    <div class="section-title">6-MONTH HISTORICAL PERFORMANCE AUDIT</div>
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="stat-label">Total Signals Tracked</div>
+            <div class="stat-value" id="stat-total">--</div>
         </div>
+        <div class="stat-card">
+            <div class="stat-label">Historical Win Rate</div>
+            <div class="stat-value" id="stat-winrate" style="color: var(--green);">--</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Wins / Losses</div>
+            <div class="stat-value" id="stat-wl">-- / --</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Avg Return / Trade</div>
+            <div class="stat-value" id="stat-avg" style="color: var(--green);">--</div>
+        </div>
+    </div>
 
-        <!-- SIGNALS OR STANDBY -->
-        {% if signals %}
-            {% for s in signals %}
-            <div class="signal-card">
-                <div class="sig-head">
-                    <div class="sig-ticker">
-                        {{ s.ticker }} <span class="market-tag">{{ s.market }}</span>
-                    </div>
-                    <div class="sig-type">{{ s.strategies }}</div>
-                </div>
-                <div class="target-grid">
-                    <div class="t-box">
-                        <div class="t-label">Entry</div>
-                        <div class="t-val text-white">${{ "%.2f"|format(s.price) }}</div>
-                    </div>
-                    <div class="t-box">
-                        <div class="t-label">Stop Loss</div>
-                        <div class="t-val val-red">-{{ s.sl_pct }}%</div>
-                    </div>
-                    <div class="t-box">
-                        <div class="t-label">Target</div>
-                        <div class="t-val val-green">+{{ s.tp_pct }}%</div>
-                    </div>
-                    <div class="t-box">
-                        <div class="t-label">R:R</div>
-                        <div class="t-val val-orange">1 : {{ s.rr }}</div>
-                    </div>
-                </div>
-                <div class="sig-footer">
-                    <span>Alloc: <strong>${{ "{:,.0f}".format(s.position) }}</strong> ({{ s.shares }} sh)</span>
-                    <span>Risk: <strong>${{ "{:,.0f}".format(s.risk) }}</strong></span>
-                </div>
-            </div>
-            {% endfor %}
-        {% else %}
-            <div class="radar-box">
-                <div class="circle-ui">
-                    <span>0%</span>
-                    <small>CONSENSUS</small>
-                </div>
-                <div class="radar-text">
-                    <h2>STANDBY // NO SIGNAL</h2>
-                    <p>Threshold: 2+ Strategy Confluence<br>Last Scan: {{ last_scan }}</p>
-                    <div class="neutral-bar">
-                        <span>N</span>
-                        <p>NEUTRAL - No Position / Vetoed</p>
-                    </div>
-                </div>
-            </div>
-        {% endif %}
-
-        <button class="btn-scan" onclick="triggerScan()" id="scanBtn">INITIATE MANUAL SCAN</button>
-
+    <!-- HISTORICAL AUTOPSY LOG TABLE -->
+    <div class="section-title">POST-MORTEM AUTOPSY & EXTENSION LOG</div>
+    <div class="table-container">
+        <table>
+            <thead>
+                <tr>
+                    <th>Date</th>
+                    <th>Symbol</th>
+                    <th>Strategy</th>
+                    <th>Entry (SL / TP)</th>
+                    <th>Planned R:R</th>
+                    <th>Outcome</th>
+                    <th style="width: 40%;">Trade Autopsy Diagnostic & Post-Target Extension</th>
+                </tr>
+            </thead>
+            <tbody id="hist-table-body">
+                <tr><td colspan="7" style="text-align:center; color: var(--text-dim);">Click 'EXECUTE SCAN' to run historical autopsy.</td></tr>
+            </tbody>
+        </table>
     </div>
 
     <script>
-        function triggerScan() {
-            const btn = document.getElementById('scanBtn');
-            btn.innerText = "SCANNING SYSTEM...";
-            btn.style.opacity = "0.5";
-            btn.disabled = true;
-            fetch('/scan').then(() => {
-                setTimeout(() => window.location.reload(), 3000);
-            });
+        async function runScan() {
+            document.getElementById('loader').style.display = 'inline-block';
+            
+            try {
+                const response = await fetch('/scan');
+                const data = await response.json();
+                
+                // Render Live Signals
+                const liveBody = document.getElementById('live-table-body');
+                liveBody.innerHTML = '';
+                
+                if (data.live_signals.length === 0) {
+                    liveBody.innerHTML = '<tr><td colspan="7" style="text-align:center; color: var(--text-dim);">No active trade signals triggered today for the watchlist.</td></tr>';
+                } else {
+                    data.live_signals.forEach(sig => {
+                        liveBody.innerHTML += `
+                            <tr>
+                                <td style="font-weight: bold; color: var(--neon-orange);">${sig.symbol}</td>
+                                <td>${sig.date}</td>
+                                <td>$${sig.price}</td>
+                                <td>${sig.signals.join(', ')}</td>
+                                <td style="color: var(--red);">$${sig.sl}</td>
+                                <td style="color: var(--green);">$${sig.tp}</td>
+                                <td><span style="color: var(--neon-orange); font-weight: bold;">${sig.rr_ratio}</span></td>
+                            </tr>
+                        `;
+                    });
+                }
+
+                // Render Historical Stats
+                const stats = data.historical_stats;
+                document.getElementById('stat-total').innerText = stats.total_trades;
+                document.getElementById('stat-winrate').innerText = `${stats.win_rate}%`;
+                document.getElementById('stat-wl').innerText = `${stats.wins} / ${stats.losses}`;
+                document.getElementById('stat-avg').innerText = `${stats.avg_return > 0 ? '+' : ''}${stats.avg_return}%`;
+
+                // Render Historical Autopsy Table
+                const histBody = document.getElementById('hist-table-body');
+                histBody.innerHTML = '';
+                
+                data.historical_logs.forEach(log => {
+                    let badgeClass = 'badge-exp';
+                    if (log.status === 'WIN') badgeClass = 'badge-win';
+                    if (log.status === 'LOSS') badgeClass = 'badge-loss';
+                    
+                    histBody.innerHTML += `
+                        <tr>
+                            <td>${log.date}</td>
+                            <td style="font-weight: bold; color: var(--neon-orange);">${log.symbol}</td>
+                            <td style="color: var(--text-dim);">${log.strategies}</td>
+                            <td>$${log.entry} <span style="font-size:11px; color: var(--text-dim);">($${log.sl} / $${log.tp})</span></td>
+                            <td style="font-weight: bold;">${log.initial_rr}</td>
+                            <td><span class="${badgeClass}">${log.status} (${log.return_pct > 0 ? '+' : ''}${log.return_pct}%)</span></td>
+                            <td style="color: #b0b3b8; font-size: 13px;">${log.autopsy}</td>
+                        </tr>
+                    `;
+                });
+
+            } catch (err) {
+                alert('Scan Engine Error: ' + err);
+            } finally {
+                document.getElementById('loader').style.display = 'none';
+            }
         }
     </script>
 </body>
 </html>
 """
 
-# ============================================================
-# ROUTES
-# ============================================================
-
-@app.route('/')
-def dashboard():
-    return render_template_string(
-        DASHBOARD_HTML,
-        signals=latest_signals,
-        last_scan=last_scan_time,
-        status="OPTIMAL" if latest_signals else "IDLE",
-        signal_count=len(latest_signals),
-        account=ACCOUNT_SIZE,
-        risk=RISK_PER_TRADE * 100,
-        max_trades=MAX_OPEN_TRADES
-    )
-
-@app.route('/scan')
-def trigger_scan():
-    threading.Thread(target=run_scan).start()
-    return jsonify({"status": "Scan initiated"})
-
-@app.route('/health')
-def health(): return "OK", 200
-
-def startup_scan():
-    time.sleep(3)
-    run_scan()
-
 if __name__ == '__main__':
-    threading.Thread(target=startup_scan, daemon=True).start()
-    app.run(host='0.0.0.0', port=10000)
+    app.run(host='0.0.0.0', port=5000, debug=True)
